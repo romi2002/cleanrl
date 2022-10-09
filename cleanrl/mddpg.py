@@ -13,7 +13,17 @@ import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
+from stable_baselines3.common.type_aliases import ReplayBufferSamples
 import gym_usv
+
+def merge_buffer_samples(s1, s2):
+    return ReplayBufferSamples(
+        observations=torch.cat((s1.observations, s2.observations)),
+        actions=torch.cat((s1.actions, s2.actions)),
+        next_observations=torch.cat((s1.next_observations, s2.next_observations)),
+        dones=torch.cat((s1.dones, s2.dones)),
+        rewards=torch.cat((s1.dones, s2.dones))
+    )
 
 def parse_args():
     # fmt: off
@@ -44,12 +54,16 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
+    parser.add_argument("--success-buffer-size", type=int, default=int(1e6),
+                       help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005,
         help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch-size", type=int, default=256,
         help="the batch size of sample from the reply memory")
+    parser.add_argument("--success-batch-size", type=int, default=256,
+                        help="the batch size of sample from the reply memory")
     parser.add_argument("--exploration-noise", type=float, default=0.1,
         help="the scale of exploration noise")
     parser.add_argument("--learning-starts", type=int, default=25e3,
@@ -163,8 +177,13 @@ if __name__ == "__main__":
     )
 
     sb = ReplayBuffer(
-
+        args.success_buffer_size,
+        envs.single_observation_space,
+        envs.single_action_space,
+        device,
+        handle_timeout_termination=True
     )
+    L = []
 
     start_time = time.time()
 
@@ -190,6 +209,15 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 break
+            if info['completed']:
+                # Slow but works I guess
+                for obs, real_next_obs, actions, rewards, dones, infos in L:
+                    sb.add(obs, real_next_obs, actions, rewards, dones, infos)
+
+                print("completed episode!")
+
+        if any(dones):
+            L = []
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
@@ -197,13 +225,20 @@ if __name__ == "__main__":
             if d:
                 real_next_obs[idx] = infos[idx]["terminal_observation"]
         rb.add(obs, real_next_obs, actions, rewards, dones, infos)
+        L.append((obs, real_next_obs, actions, rewards, dones, infos))
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
+            rb_data = rb.sample(args.batch_size)
+            if sb.size() > 0:
+                sb_data = sb.sample(args.success_batch_size)
+                data = merge_buffer_samples(rb_data, sb_data)
+            else:
+                data = rb_data
+
             with torch.no_grad():
                 next_state_actions = target_actor(data.next_observations)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
@@ -233,7 +268,7 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
+                #print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     envs.close()
