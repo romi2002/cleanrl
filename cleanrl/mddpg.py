@@ -161,6 +161,11 @@ if __name__ == "__main__":
         device,
         handle_timeout_termination=True,
     )
+
+    sb = ReplayBuffer(
+
+    )
+
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
