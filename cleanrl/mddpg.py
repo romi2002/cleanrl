@@ -83,7 +83,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
-                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", video_length=3000)
         env.seed(seed)
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
@@ -111,9 +111,9 @@ class QNetwork(nn.Module):
 class Actor(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 1024)
+        self.fc2 = nn.Linear(1024, 1024)
+        self.fc_mu = nn.Linear(1024, np.prod(env.single_action_space.shape))
         # action rescaling
         self.register_buffer("action_scale", torch.FloatTensor((env.action_space.high - env.action_space.low) / 2.0))
         self.register_buffer("action_bias", torch.FloatTensor((env.action_space.high + env.action_space.low) / 2.0))
@@ -224,6 +224,12 @@ if __name__ == "__main__":
         for idx, d in enumerate(dones):
             if d:
                 real_next_obs[idx] = infos[idx]["terminal_observation"]
+                if infos[idx]['completed']:
+                    # Slow but works I guess
+                    for obs, real_next_obs, actions, rewards, dones, infos in L:
+                        sb.add(obs, real_next_obs, actions, rewards, dones, infos)
+
+                    print("completed episode 2!")
         rb.add(obs, real_next_obs, actions, rewards, dones, infos)
         L.append((obs, real_next_obs, actions, rewards, dones, infos))
 
@@ -264,11 +270,11 @@ if __name__ == "__main__":
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % 100 == 0:
+            if global_step % 10000 == 0:
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                #print("SPS:", int(global_step / (time.time() - start_time)))
+                print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     envs.close()
