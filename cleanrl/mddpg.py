@@ -50,7 +50,7 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=3e-4,
+    parser.add_argument("--learning-rate", type=float, default=2e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -62,13 +62,13 @@ def parse_args():
         help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch-size", type=int, default=256,
         help="the batch size of sample from the reply memory")
-    parser.add_argument("--success-batch-size", type=int, default=256,
+    parser.add_argument("--success-batch-size", type=int, default=64,
                         help="the batch size of sample from the reply memory")
-    parser.add_argument("--exploration-noise", type=float, default=0.1,
+    parser.add_argument("--exploration-noise", type=float, default=0.15,
         help="the scale of exploration noise")
     parser.add_argument("--learning-starts", type=int, default=25e3,
         help="timestep to start learning")
-    parser.add_argument("--policy-frequency", type=int, default=2,
+    parser.add_argument("--policy-frequency", type=int, default=4,
         help="the frequency of training policy (delayed)")
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
@@ -189,6 +189,7 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs = envs.reset()
+    completed_episodes = 0
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -209,12 +210,6 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 break
-            if info['completed']:
-                # Slow but works I guess
-                for obs, real_next_obs, actions, rewards, dones, infos in L:
-                    sb.add(obs, real_next_obs, actions, rewards, dones, infos)
-
-                print("completed episode!")
 
         if any(dones):
             L = []
@@ -224,12 +219,13 @@ if __name__ == "__main__":
         for idx, d in enumerate(dones):
             if d:
                 real_next_obs[idx] = infos[idx]["terminal_observation"]
-                if infos[idx]['completed']:
+                if "completed" in infos[idx] and infos[idx]['completed']:
                     # Slow but works I guess
                     for obs, real_next_obs, actions, rewards, dones, infos in L:
                         sb.add(obs, real_next_obs, actions, rewards, dones, infos)
 
                     print("completed episode 2!")
+                    completed_episodes += 1
         rb.add(obs, real_next_obs, actions, rewards, dones, infos)
         L.append((obs, real_next_obs, actions, rewards, dones, infos))
 
@@ -274,6 +270,7 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
+                writer.add_scalar("completed_episodes", completed_episodes, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 

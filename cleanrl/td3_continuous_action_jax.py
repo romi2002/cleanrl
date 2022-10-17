@@ -9,15 +9,28 @@ from typing import Sequence
 import flax
 import flax.linen as nn
 import gym
+import gym.envs.box2d
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pybullet_envs  # noqa
+from functools import partial
+#import pybullet_envs  # noqa
 from flax.training.train_state import TrainState
 from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from torch.utils.tensorboard import SummaryWriter
+import gym_usv
+import torch
 
+def merge_buffer_samples(s1, s2):
+    return ReplayBufferSamples(
+        observations=torch.cat((s1.observations, s2.observations)),
+        actions=torch.cat((s1.actions, s2.actions)),
+        next_observations=torch.cat((s1.next_observations, s2.next_observations)),
+        dones=torch.cat((s1.dones, s2.dones)),
+        rewards=torch.cat((s1.dones, s2.dones))
+    )
 
 def parse_args():
     # fmt: off
@@ -52,7 +65,9 @@ def parse_args():
         help="the scale of policy noise")
     parser.add_argument("--batch-size", type=int, default=256,
         help="the batch size of sample from the reply memory")
-    parser.add_argument("--exploration-noise", type=float, default=0.1,
+    parser.add_argument("--success-batch-size", type=int, default=64*5,
+                        help="the batch size of sample from the reply memory")
+    parser.add_argument("--exploration-noise", type=float, default=0.10,
         help="the scale of exploration noise")
     parser.add_argument("--learning-starts", type=int, default=25e3,
         help="timestep to start learning")
@@ -60,6 +75,7 @@ def parse_args():
         help="the frequency of training policy (delayed)")
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
+    parser.add_argument("--use-success-buffer", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True)
     args = parser.parse_args()
     # fmt: on
     return args
@@ -85,9 +101,9 @@ class QNetwork(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, a: jnp.ndarray):
         x = jnp.concatenate([x, a], -1)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(400)(x)
         x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(300)(x)
         x = nn.relu(x)
         x = nn.Dense(1)(x)
         return x
@@ -100,9 +116,9 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(256)(x)
+        x = nn.Dense(400)(x)
         x = nn.relu(x)
-        x = nn.Dense(256)(x)
+        x = nn.Dense(300)(x)
         x = nn.relu(x)
         x = nn.Dense(self.action_dim)(x)
         x = nn.tanh(x)
@@ -129,11 +145,15 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
+        wandb.run.log_code(".")
+
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+
+    print(args)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -154,6 +174,16 @@ if __name__ == "__main__":
         device="cpu",
         handle_timeout_termination=True,
     )
+
+    sb = ReplayBuffer(
+        args.buffer_size,
+        envs.single_observation_space,
+        envs.single_action_space,
+        device="cpu",
+        handle_timeout_termination=True,
+    )
+    L = []
+
 
     # TRY NOT TO MODIFY: start the game
     obs = envs.reset()
@@ -225,6 +255,7 @@ if __name__ == "__main__":
 
         return (qf1_state, qf2_state), (qf1_loss_value, qf2_loss_value), (qf1_a_values, qf2_a_values), key
 
+    completed_episodes = 0
     @jax.jit
     def update_actor(
         actor_state: TrainState,
@@ -281,14 +312,37 @@ if __name__ == "__main__":
         for idx, d in enumerate(dones):
             if d:
                 real_next_obs[idx] = infos[idx]["terminal_observation"]
+
+                if args.env_id == 'Pendulum-v1':
+                    c,s,vel = obs[0]
+                    infos[idx]['completed'] = np.abs(c - 1) + np.abs(s) + np.abs(vel) < 0.1
+
+                if "completed" in infos[idx] and infos[idx]['completed']:
+                    # Slow but works I guess
+                    for obs, real_next_obs, actions, rewards, dones, infos in L:
+                        sb.add(obs, real_next_obs, actions, rewards, dones, infos)
+
+                    print("completed episode 2!")
+                    completed_episodes += 1
+
         rb.add(obs, real_next_obs, actions, rewards, dones, infos)
+        if args.use_success_buffer:
+            L.append((obs, real_next_obs, actions, rewards, dones, infos))
+
+        if any(dones):
+            L = []
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
+            if sb.size() > 0 and args.use_success_buffer:
+                rb_data = rb.sample(args.batch_size)
+                sb_data = sb.sample(args.success_batch_size)
+                data = merge_buffer_samples(rb_data, sb_data)
+            else:
+                data = rb.sample(args.batch_size)
 
             (qf1_state, qf2_state), (qf1_loss_value, qf2_loss_value), (qf1_a_values, qf2_a_values), key = update_critic(
                 actor_state,
@@ -309,12 +363,13 @@ if __name__ == "__main__":
                     qf2_state,
                     data.observations.numpy(),
                 )
-            if global_step % 100 == 0:
+            if global_step % 1000 == 0:
                 writer.add_scalar("losses/qf1_loss", qf1_loss_value.item(), global_step)
                 writer.add_scalar("losses/qf2_loss", qf2_loss_value.item(), global_step)
                 writer.add_scalar("losses/qf1_values", qf1_a_values.item(), global_step)
                 writer.add_scalar("losses/qf2_values", qf2_a_values.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss_value.item(), global_step)
+                writer.add_scalar("charts/completed_episodes", completed_episodes, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
