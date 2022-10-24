@@ -49,7 +49,7 @@ def parse_args():
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--gamma", type=float, default=0.999,
+    parser.add_argument("--gamma", type=float, default=0.98,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
@@ -121,18 +121,47 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(128, np.prod(envs.single_action_space.shape)), std=0.01),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+        self.actor_logstd = nn.Parameter(torch.ones(128, np.prod(envs.single_action_space.shape)) * -3.3)
+        self.exploration_mat = None
+        self.exploration_matrices = None
+        self.weights_dist = None
+        self.sample_weights()
 
     def get_value(self, x):
         return self.critic(x)
 
+    def get_std(self, log_std):
+        std = torch.exp(log_std)
+        return torch.ones(128, np.prod(envs.single_action_space.shape)).to(log_std.device) * std
+    def sample_weights(self):
+        std = self.get_std(self.actor_logstd)
+        self.weights_dist = Normal(torch.zeros_like(std), std)
+        # Reparametrization trick to pass gradients
+        self.exploration_mat = self.weights_dist.rsample()
+        # Pre-compute matrices in case of parallel exploration
+        self.exploration_matrices = self.weights_dist.rsample((1,))
+
+    def get_noise(self, latent_sde):
+        # Default case: only one exploration matrix
+        if len(latent_sde) == 1 or len(latent_sde) != len(self.exploration_matrices):
+            return torch.mm(latent_sde, self.exploration_mat)
+        # Use batch matrix multiplication for efficient computation
+        # (batch_size, n_features) -> (batch_size, 1, n_features)
+        latent_sde = latent_sde.unsqueeze(1)
+        # (batch_size, 1, n_actions)
+        noise = torch.bmm(latent_sde, self.exploration_matrices)
+        return noise.squeeze(1)
+
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        latent_sde = self.actor_mean[:-1](x)
+        action_std = self.get_std(self.actor_logstd)
+
+        variance = torch.mm(latent_sde ** 2, action_std ** 2)
+        probs = Normal(action_mean, torch.sqrt(variance + 1e-6))
+
         if action is None:
-            action = probs.sample()
+            action = probs.mean + self.get_noise(latent_sde)
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 
 
@@ -201,6 +230,9 @@ if __name__ == "__main__":
             obs[step] = next_obs
             dones[step] = next_done
 
+            if step % 8 == 0:
+                agent.sample_weights()
+
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
@@ -257,6 +289,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
+                agent.sample_weights()
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
