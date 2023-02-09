@@ -2,6 +2,7 @@
 import argparse
 import os
 import random
+import shutil
 import time
 from distutils.util import strtobool
 from typing import Sequence
@@ -17,6 +18,8 @@ from flax.training.train_state import TrainState
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 import gym_usv
+from flax.training import checkpoints
+from flax.training.checkpoints import save_checkpoint
 
 def parse_args():
     # fmt: off
@@ -57,6 +60,7 @@ def parse_args():
         help="the frequency of training policy (delayed)")
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
+    parser.add_argument("--steps-before-save", type=int, default=100)
     args = parser.parse_args()
     # fmt: on
     return args
@@ -76,6 +80,20 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
+def save_model(checkpoint_name, actor_state, critic_state, step, config):
+    ckpt = {'actor': actor_state, 'critic': critic_state, 'config': config, 'step': step}
+    ckpt_dir = f'tmp/flax-checkpointing-{checkpoint_name}'
+    if os.path.exists(ckpt_dir):
+        shutil.rmtree(ckpt_dir)
+
+    filename = checkpoints.save_checkpoint(
+        ckpt_dir=ckpt_dir,
+        target=ckpt,
+        step=0,
+        overwrite=False,
+        keep=2
+    )
+    print(f"Saved to: {filename}")
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
@@ -253,6 +271,11 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
+
+        if(global_step >= args.steps_before_save):
+            print("Saving model!")
+            save_model("checkpoint", actor_state, qf1_state, global_step, vars(args))
+            exit(0)
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
