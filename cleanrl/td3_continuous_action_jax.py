@@ -8,17 +8,23 @@ from typing import Sequence
 
 import flax
 import flax.linen as nn
-import gym
-import gym.envs.box2d
+import gymnasium as gym
+import gym as old_gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from functools import partial
 #import pybullet_envs  # noqa
+import sys
+
 from flax.training.train_state import TrainState
+
+sys.modules["gym"] = gym
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
+sys.modules["gym"] = old_gym
+
 from torch.utils.tensorboard import SummaryWriter
 import gym_usv
 import torch
@@ -53,25 +59,25 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=3e-4,
+    parser.add_argument("--learning-rate", type=float, default=1e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
-    parser.add_argument("--gamma", type=float, default=0.99,
+    parser.add_argument("--gamma", type=float, default=0.999,
         help="the discount factor gamma")
-    parser.add_argument("--tau", type=float, default=0.005,
+    parser.add_argument("--tau", type=float, default=0.001,
         help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--policy-noise", type=float, default=0.2,
+    parser.add_argument("--policy-noise", type=float, default=0.25,
         help="the scale of policy noise")
-    parser.add_argument("--batch-size", type=int, default=256,
+    parser.add_argument("--batch-size", type=int, default=256*2,
         help="the batch size of sample from the reply memory")
-    parser.add_argument("--success-batch-size", type=int, default=64*5,
+    parser.add_argument("--success-batch-size", type=int, default=64,
                         help="the batch size of sample from the reply memory")
-    parser.add_argument("--exploration-noise", type=float, default=0.10,
+    parser.add_argument("--exploration-noise", type=float, default=0.2,
         help="the scale of exploration noise")
     parser.add_argument("--learning-starts", type=int, default=25e3,
         help="timestep to start learning")
-    parser.add_argument("--policy-frequency", type=int, default=2,
+    parser.add_argument("--policy-frequency", type=int, default=8,
         help="the frequency of training policy (delayed)")
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
@@ -88,9 +94,9 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.seed(seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
+        #env.seed(seed)
+        #env.action_space.seed(seed)
+        #env.observation_space.seed(seed)
         return env
 
     return thunk
@@ -186,7 +192,7 @@ if __name__ == "__main__":
 
 
     # TRY NOT TO MODIFY: start the game
-    obs = envs.reset()
+    obs, _ = envs.reset()
     actor = Actor(
         action_dim=np.prod(envs.single_action_space.shape),
         action_scale=jnp.array((envs.action_space.high - envs.action_space.low) / 2.0),
@@ -284,6 +290,7 @@ if __name__ == "__main__":
         return actor_state, (qf1_state, qf2_state), actor_loss_value
 
     start_time = time.time()
+    video_filenames = set()
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -300,37 +307,41 @@ if __name__ == "__main__":
             )
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, dones, infos = envs.step(actions)
+        next_obs, rewards, dones, _, infos = envs.step(actions)
+
+        if "final_info" not in infos:
+            continue
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        for info in infos:
-            if "episode" in info.keys():
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                break
+        for info in infos["final_info"]:
+            # Skip the envs that are not done
+            if info is None:
+                continue
+            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # TRY NOT TO MODIFY: save data to replay buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
         for idx, d in enumerate(dones):
             if d:
-                real_next_obs[idx] = infos[idx]["terminal_observation"]
+                real_next_obs[idx] = infos["final_observation"][0].reshape(1, -1)
 
                 if args.env_id == 'Pendulum-v1':
                     c,s,vel = obs[0]
                     infos[idx]['completed'] = np.abs(c - 1) + np.abs(s) + np.abs(vel) < 0.1
 
-                if "completed" in infos[idx] and infos[idx]['completed']:
+                if "completed" in infos["final_info"][0] and infos["final_info"][0]['completed']:
                     # Slow but works I guess
                     for obs, real_next_obs, actions, rewards, dones, infos in L:
                         sb.add(obs, real_next_obs, actions, rewards, dones, infos)
 
-                    print("completed episode 2!")
+                    print(f"completed episode {completed_episodes}")
                     completed_episodes += 1
 
-        rb.add(obs, real_next_obs, actions, rewards, dones, infos)
+        rb.add(obs, real_next_obs, actions, rewards, dones, [infos])
         if args.use_success_buffer:
-            L.append((obs, real_next_obs, actions, rewards, dones, infos))
+            L.append((obs, real_next_obs, actions, rewards, dones, [infos]))
 
         if any(dones):
             L = []
@@ -376,5 +387,10 @@ if __name__ == "__main__":
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+            if args.track and args.capture_video:
+                for filename in os.listdir(f"videos/{run_name}"):
+                    if filename not in video_filenames and filename.endswith(".mp4"):
+                        wandb.log({f"videos": wandb.Video(f"videos/{run_name}/{filename}")})
+                        video_filenames.add(filename)
     envs.close()
     writer.close()

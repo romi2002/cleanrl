@@ -5,14 +5,20 @@ import random
 import time
 from distutils.util import strtobool
 
-import gym
+import gymnasium as gym
+import gym as old_gym
 import numpy as np
-import pybullet_envs  # noqa
+import gym_usv
+#import pybullet_envs  # noqa
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import sys
+sys.modules["gym"] = gym
 from stable_baselines3.common.buffers import ReplayBuffer
+sys.modules["gym"] = old_gym
+
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -29,7 +35,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument("--wandb-project-name", type=str, default="sac",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -79,9 +85,9 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.seed(seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
+        #env.seed(seed)
+        #env.action_space.seed(seed)
+        #env.observation_space.seed(seed)
         return env
 
     return thunk
@@ -210,9 +216,10 @@ if __name__ == "__main__":
         handle_timeout_termination=True,
     )
     start_time = time.time()
+    video_filenames = set()
 
     # TRY NOT TO MODIFY: start the game
-    obs = envs.reset()
+    obs, _ = envs.reset()
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -222,22 +229,27 @@ if __name__ == "__main__":
             actions = actions.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, dones, infos = envs.step(actions)
+        next_obs, rewards, dones, _, infos = envs.step(actions)
+        infos = [infos]
+
+        if "final_info" not in infos:
+            continue
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        for info in infos:
-            if "episode" in info.keys():
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                break
+        for info in infos["final_info"]:
+            # Skip the envs that are not done
+            if info is None:
+                continue
+            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
         for idx, d in enumerate(dones):
             if d:
-                real_next_obs[idx] = infos[idx]["terminal_observation"]
-        rb.add(obs, real_next_obs, actions, rewards, dones, infos)
+                real_next_obs[idx] = infos["final_observation"][idx].reshape(1, -1)
+        rb.add(obs, real_next_obs, actions, rewards, dones, [infos])
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -306,5 +318,10 @@ if __name__ == "__main__":
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 
+            if args.track and args.capture_video:
+                for filename in os.listdir(f"videos/{run_name}"):
+                    if filename not in video_filenames and filename.endswith(".mp4"):
+                        wandb.log({f"videos": wandb.Video(f"videos/{run_name}/{filename}")})
+                        video_filenames.add(filename)
     envs.close()
     writer.close()

@@ -9,13 +9,19 @@ from typing import Sequence
 
 import flax
 import flax.linen as nn
-import gym
+import gymnasium as gym
+import gym as old_gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.training.train_state import TrainState
+import sys
+
+sys.modules["gym"] = gym
 from stable_baselines3.common.buffers import ReplayBuffer
+sys.modules["gym"] = old_gym
+
 from torch.utils.tensorboard import SummaryWriter
 import gym_usv
 from flax.training import checkpoints
@@ -40,9 +46,9 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="HalfCheetah-v2",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=1000000,
+    parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=3e-4,
+    parser.add_argument("--learning-rate", type=float, default=1e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -60,22 +66,27 @@ def parse_args():
         help="the frequency of training policy (delayed)")
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
-    parser.add_argument("--steps-before-save", type=int, default=100)
+    parser.add_argument("--steps-before-save", type=int, default=10000000)
     args = parser.parse_args()
     # fmt: on
     return args
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.seed(seed)
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
+        #env = gym.wrappers.ClipAction(env)
+        #env = gym.wrappers.NormalizeObservation(env)
+        #env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+        #env = gym.wrappers.NormalizeReward(env, gamma=gamma)
+        #env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+        #env.seed(seed)
+        #env.action_space.seed(seed)
+        #env.observation_space.seed(seed)
         return env
 
     return thunk
@@ -157,7 +168,9 @@ if __name__ == "__main__":
     key, actor_key, qf1_key = jax.random.split(key, 3)
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, 0, args.capture_video, run_name, args.gamma)]
+    )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
@@ -171,7 +184,7 @@ if __name__ == "__main__":
     )
 
     # TRY NOT TO MODIFY: start the game
-    obs = envs.reset()
+    obs, _ = envs.reset()
     action_scale = np.array((envs.action_space.high - envs.action_space.low) / 2.0)
     action_bias = np.array((envs.action_space.high + envs.action_space.low) / 2.0)
     actor = Actor(
@@ -237,6 +250,7 @@ if __name__ == "__main__":
         return actor_state, qf1_state, actor_loss_value
 
     start_time = time.time()
+    video_filenames = set()
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -252,22 +266,25 @@ if __name__ == "__main__":
             )
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, dones, infos = envs.step(actions)
+        next_obs, rewards, dones, _, infos = envs.step(actions)
+        # Only print when at least 1 env is done
+        if "final_info" not in infos:
+            continue
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        for info in infos:
-            if "episode" in info.keys():
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                break
+        for info in infos["final_info"]:
+            # Skip the envs that are not done
+            if info is None:
+                continue
+            print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+            writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+            writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
         for idx, d in enumerate(dones):
             if d:
-                real_next_obs[idx] = infos[idx]["terminal_observation"]
-        rb.add(obs, real_next_obs, actions, rewards, dones, infos)
+                real_next_obs[idx] = infos["final_observation"][0].reshape(1, -1)
+        rb.add(obs, real_next_obs, actions, rewards, dones, [infos])
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -303,5 +320,10 @@ if __name__ == "__main__":
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
+            if args.track and args.capture_video:
+                for filename in os.listdir(f"videos/{run_name}"):
+                    if filename not in video_filenames and filename.endswith(".mp4"):
+                        wandb.log({f"videos": wandb.Video(f"videos/{run_name}/{filename}")})
+                        video_filenames.add(filename)
     envs.close()
     writer.close()
