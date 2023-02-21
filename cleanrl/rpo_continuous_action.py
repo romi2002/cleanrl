@@ -14,6 +14,8 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 import gym_usv
 
+CHECKPOINT_FREQUENCY = 10
+
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
@@ -47,9 +49,9 @@ def parse_args():
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--gamma", type=float, default=0.975,
+    parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.95,
+    parser.add_argument("--gae-lambda", type=float, default=0.99,
         help="the lambda for the general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=32,
         help="the number of mini-batches")
@@ -78,12 +80,12 @@ def parse_args():
     return args
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma):
+def make_env(env_id, idx, capture_video, run_name, gamma, args=[]):
     def thunk():
         if capture_video:
-            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.make(env_id, render_mode="rgb_array", *args)
         else:
-            env = gym.make(env_id)
+            env = gym.make(env_id, *args)
         env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
@@ -334,6 +336,13 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        if args.track and update % CHECKPOINT_FREQUENCY == 0:
+            state = agent.state_dict()
+            state['obs_rms_mean'] = envs.envs[0].obs_rms.mean
+            state['obs_rms_var'] = envs.envs[0].obs_rms.var
+            torch.save(state, f"{wandb.run.dir}/agent_{update}.pt")
+            wandb.save(f"{wandb.run.dir}/agent_{update}.pt", policy="now")
 
         if args.track and args.capture_video:
             for filename in os.listdir(f"videos/{run_name}"):
