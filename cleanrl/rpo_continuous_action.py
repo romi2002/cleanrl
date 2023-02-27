@@ -29,7 +29,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanrl_rpo",
+    parser.add_argument("--wandb-project-name", type=str, default="lidar_usv_ca",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -39,19 +39,19 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="usv-asmc-ca-v0",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=8000000,
+    parser.add_argument("--total-timesteps", type=int, default=8000000*8,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=8,
+    parser.add_argument("--num-envs", type=int, default=1,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=2048,
+    parser.add_argument("--num-steps", type=int, default=2048*8,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--gae-lambda", type=float, default=0.99,
+    parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=32,
         help="the number of mini-batches")
@@ -80,12 +80,12 @@ def parse_args():
     return args
 
 
-def make_env(env_id, idx, capture_video, run_name, gamma, args=[]):
+def make_env(env_id, idx, capture_video, run_name, gamma, perturb_range=[0,0], perturb_amount=[0, 0]):
     def thunk():
         if capture_video:
-            env = gym.make(env_id, render_mode="rgb_array", *args)
+            env = gym.make(env_id, perturb_range=perturb_range, perturb_amount=perturb_amount)
         else:
-            env = gym.make(env_id, *args)
+            env = gym.make(env_id, perturb_range=perturb_range, perturb_amount=perturb_amount)
         env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if capture_video:
@@ -112,22 +112,26 @@ class Agent(nn.Module):
         super().__init__()
         self.rpo_alpha = rpo_alpha
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 200)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 300)),
             nn.Tanh(),
-            layer_init(nn.Linear(200, 200)),
+            layer_init(nn.Linear(300, 400)),
             nn.Tanh(),
-            layer_init(nn.Linear(200, 300)),
+            layer_init(nn.Linear(400, 400)),
             nn.Tanh(),
-            layer_init(nn.Linear(300, 1), std=1.0),
+            layer_init(nn.Linear(400, 400)),
+            nn.Tanh(),
+            layer_init(nn.Linear(400, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 200)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 300)),
             nn.Tanh(),
-            layer_init(nn.Linear(200, 200)),
+            layer_init(nn.Linear(300, 400)),
             nn.Tanh(),
-            layer_init(nn.Linear(200, 300)),
+            layer_init(nn.Linear(400, 400)),
             nn.Tanh(),
-            layer_init(nn.Linear(300, np.prod(envs.single_action_space.shape)), std=0.01),
+            layer_init(nn.Linear(400, 400)),
+            nn.Tanh(),
+            layer_init(nn.Linear(400, np.prod(envs.single_action_space.shape)), std=0.01),
         )
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
@@ -339,8 +343,10 @@ if __name__ == "__main__":
 
         if args.track and update % CHECKPOINT_FREQUENCY == 0:
             state = agent.state_dict()
-            state['obs_rms_mean'] = envs.envs[0].obs_rms.mean
-            state['obs_rms_var'] = envs.envs[0].obs_rms.var
+            state['obs_rms_mean'] = [e.obs_rms.mean for e in envs.envs]
+            state['obs_rms_var'] = [e.obs_rms.var for e in envs.envs]
+            state['obs_rms_count'] = [e.obs_rms.count for e in envs.envs]
+            print(state['obs_rms_count'])
             torch.save(state, f"{wandb.run.dir}/agent_{update}.pt")
             wandb.save(f"{wandb.run.dir}/agent_{update}.pt", policy="now")
 
