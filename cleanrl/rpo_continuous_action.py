@@ -12,9 +12,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+import pickle
 import gym_usv
 
-CHECKPOINT_FREQUENCY = 10
+CHECKPOINT_FREQUENCY = 5
 
 def parse_args():
     # fmt: off
@@ -43,9 +44,9 @@ def parse_args():
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=3e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=1,
+    parser.add_argument("--num-envs", type=int, default=8,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=2048*8,
+    parser.add_argument("--num-steps", type=int, default=2048,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -91,11 +92,7 @@ def make_env(env_id, idx, capture_video, run_name, gamma, perturb_range=[0,0], p
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+
         return env
 
     return thunk
@@ -187,6 +184,13 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
+
+    envs = gym.wrappers.ClipAction(envs)
+    envs = gym.wrappers.NormalizeObservation(envs)
+    envs = gym.wrappers.TransformObservation(envs, lambda obs: np.clip(obs, -10, 10))
+    envs = gym.wrappers.NormalizeReward(envs, gamma=args.gamma)
+    envs = gym.wrappers.TransformReward(envs, lambda reward: np.clip(reward, -10, 10))
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs, args.rpo_alpha).to(device)
@@ -342,10 +346,10 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
         if args.track and update % CHECKPOINT_FREQUENCY == 0:
-            state = agent.state_dict()
-            state['obs_rms_mean'] = [e.obs_rms.mean for e in envs.envs]
-            state['obs_rms_var'] = [e.obs_rms.var for e in envs.envs]
-            state['obs_rms_count'] = [e.obs_rms.count for e in envs.envs]
+            state = agent.state_dict().copy()
+            state['obs_rms_mean'] = envs.obs_rms.mean
+            state['obs_rms_var'] = envs.obs_rms.var
+            state['obs_rms_count'] = envs.obs_rms.count
             print(state['obs_rms_count'])
             torch.save(state, f"{wandb.run.dir}/agent_{update}.pt")
             wandb.save(f"{wandb.run.dir}/agent_{update}.pt", policy="now")
@@ -353,7 +357,16 @@ if __name__ == "__main__":
         if args.track and args.capture_video:
             for filename in os.listdir(f"videos/{run_name}"):
                 if filename not in video_filenames and filename.endswith(".mp4"):
+                    agent_filename = f"{wandb.run.dir}/agent_{filename}.pt"
+                    obs_rms_filename = f"{wandb.run.dir}/obs_rms_{filename}.pickle"
+                    torch.save(agent.state_dict(), agent_filename)
+
+                    obs_rms_state = {'mean': envs.obs_rms.mean, 'var': envs.obs_rms.var, 'count': envs.obs_rms.var}
+                    pickle.dump(obs_rms_state, open(obs_rms_filename, 'wb'))
+
                     wandb.log({f"videos": wandb.Video(f"videos/{run_name}/{filename}")})
+                    wandb.save(agent_filename)
+                    wandb.save(obs_rms_filename)
                     video_filenames.add(filename)
 
     envs.close()
