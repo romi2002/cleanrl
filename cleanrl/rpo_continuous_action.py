@@ -46,7 +46,7 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=8,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=2048,
+    parser.add_argument("--num-steps", type=int, default=1024,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -181,7 +181,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
+    envs = gym.vector.AsyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
 
@@ -189,7 +189,7 @@ if __name__ == "__main__":
     envs = gym.wrappers.NormalizeObservation(envs)
     envs = gym.wrappers.TransformObservation(envs, lambda obs: np.clip(obs, -10, 10))
     envs = gym.wrappers.NormalizeReward(envs, gamma=args.gamma)
-    envs = gym.wrappers.TransformReward(envs, lambda reward: np.clip(reward, -10, 10))
+    envs = gym.wrappers.TransformReward(envs, lambda reward: np.clip(reward, -50, 50))
 
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -361,7 +361,7 @@ if __name__ == "__main__":
                     obs_rms_filename = f"{wandb.run.dir}/obs_rms_{filename}.pickle"
                     torch.save(agent.state_dict(), agent_filename)
 
-                    obs_rms_state = {'mean': envs.obs_rms.mean, 'var': envs.obs_rms.var, 'count': envs.obs_rms.var}
+                    obs_rms_state = {'mean': envs.obs_rms.mean, 'var': envs.obs_rms.var, 'count': envs.obs_rms.count}
                     pickle.dump(obs_rms_state, open(obs_rms_filename, 'wb'))
 
                     wandb.log({f"videos": wandb.Video(f"videos/{run_name}/{filename}")})

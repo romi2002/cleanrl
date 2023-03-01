@@ -4,7 +4,7 @@ import os
 import random
 import time
 from distutils.util import strtobool
-
+import pid_env
 import gymnasium as gym
 import numpy as np
 import torch
@@ -13,6 +13,14 @@ import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 import gym_usv
+
+from gymnasium.envs.registration import register
+
+register(
+     id="pid/PIDEnv",
+     entry_point="pid_env:PIDEnv",
+     max_episode_steps=300,
+)
 
 def parse_args():
     # fmt: off
